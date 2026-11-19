@@ -1,0 +1,6 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {cycleAlerts} from '../lib/bill-cycles.ts';
+const p:any={id:'p',archived:false};const bill=(start:string,end:string,billDate?:string):any=>({provider:'p',start,end,billDate});
+test('shared boundaries and inclusive next day are contiguous',()=>{assert.equal(cycleAlerts(p,[bill('2026-05-01','2026-05-21'),bill('2026-05-21','2026-06-22'),bill('2026-06-23','2026-07-22')],new Date('2026-07-23')).alerts.length,0);});
+test('missing month produces precise gap',()=>{assert.match(cycleAlerts(p,[bill('2026-05-01','2026-05-31'),bill('2026-07-01','2026-07-31')],new Date('2026-08-01')).alerts[0],/2026-06-01 to 2026-06-30/);});
+test('overlap does not create false gap',()=>{assert.equal(cycleAlerts(p,[bill('2026-05-01','2026-07-31'),bill('2026-06-01','2026-06-30'),bill('2026-08-01','2026-08-31')],new Date('2026-08-01')).alerts.length,0);});
+test('stale active history alerts; archived does not expect new bills',()=>{const b=[bill('2026-01-01','2026-01-31','2026-02-05'),bill('2026-02-01','2026-02-28','2026-03-05')];assert.match(cycleAlerts(p,b,new Date('2026-04-15')).alerts[0],/Possibly missing/);assert.equal(cycleAlerts({...p,archived:true},b,new Date('2026-04-15')).alerts.length,0);});
