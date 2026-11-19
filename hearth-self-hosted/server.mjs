@@ -1,0 +1,28 @@
+import express from 'express';
+import multer from 'multer';
+import {DatabaseSync} from 'node:sqlite';
+import {createHash,randomUUID} from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {parseBill} from './lib/bill-import.ts';
+const root=path.dirname(fileURLToPath(import.meta.url));
+export function createApp(dataDir){
+ fs.mkdirSync(path.join(dataDir,'bills'),{recursive:true});
+ const db=new DatabaseSync(path.join(dataDir,'hearth.sqlite'));
+ db.exec("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL); CREATE UNIQUE INDEX IF NOT EXISTS bill_cycle ON records(json_extract(data,'$.provider'),json_extract(data,'$.start'),json_extract(data,'$.end')) WHERE kind='bill'; CREATE TABLE IF NOT EXISTS files(key TEXT PRIMARY KEY,filename TEXT NOT NULL);");
+ const app=express();app.disable('x-powered-by');
+ app.use((req,res,next)=>{const host=req.hostname;if(!['localhost','127.0.0.1','::1','[::1]'].includes(host))return res.status(403).json({error:'This package accepts localhost connections only.'});if(req.headers.origin){try{if(new URL(req.headers.origin).host!==req.headers.host && req.headers.origin!=='http://127.0.0.1:5173')return res.status(403).json({error:'Cross-origin request blocked.'});}catch{return res.sendStatus(403);}}res.set('X-Content-Type-Options','nosniff');next();});
+ app.use(express.json({limit:'32kb'}));
+ const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:15*1024*1024,files:1,fieldSize:600000}}).single('file');
+ const putFile=(f,name)=>{if(!f||f.buffer.subarray(0,5).toString()!=='%PDF-')throw new Error('Choose a valid PDF under 15 MB.');const key=createHash('sha256').update(f.buffer).digest('hex')+'.pdf';fs.writeFileSync(path.join(dataDir,'bills',key),f.buffer,{flag:'w',mode:0o600});db.prepare('INSERT OR IGNORE INTO files VALUES (?,?)').run(key,name);return key;};
+ const save=x=>db.prepare('INSERT INTO records VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,data=excluded.data').run(x.id,x.kind,JSON.stringify(x));
+ app.get('/api/records',(_req,res)=>res.json(db.prepare('SELECT data FROM records').all().map(r=>JSON.parse(r.data))));
+ app.post('/api/records',(req,res)=>{const x=req.body;if(!x||typeof x.id!=='string'||!['provider','bill'].includes(x.kind))return res.status(400).json({error:'Invalid record.'});if(x.kind==='provider'&&(!x.name||!['Electricity','Water','Gas','Internet','Waste','Other'].includes(x.type)))return res.status(400).json({error:'Provider name and type required.'});if(x.kind==='bill'&&(!x.provider||!/^\d{4}-\d{2}-\d{2}$/.test(x.start)||!/^\d{4}-\d{2}-\d{2}$/.test(x.end)||x.start>x.end||!Number.isFinite(x.cost)||x.cost<0||(x.usage!==null&&(!Number.isFinite(x.usage)||x.usage<0))))return res.status(400).json({error:'Check dates and amounts.'});try{save(x);res.json({ok:true});}catch(e){if(String(e).includes('UNIQUE'))return res.status(409).json({error:'This provider bill is already saved.'});throw e;}});
+ app.post('/api/files',upload,(req,res)=>{try{const key=putFile(req.file,'Utility bill.pdf');res.json({key});}catch(e){res.status(400).json({error:e.message});}});
+ app.get('/api/files',(req,res)=>{const key=String(req.query.key||'');if(!/^[a-f0-9]{64}\.pdf$/.test(key))return res.sendStatus(400);const row=db.prepare('SELECT filename FROM files WHERE key=?').get(key);if(!row)return res.sendStatus(404);res.set({'Content-Type':'application/pdf','Content-Disposition':`inline; filename="${row.filename.replace(/[^a-zA-Z0-9 ._-]/g,'_')}"`,'Cache-Control':'no-store'});res.sendFile(path.join(dataDir,'bills',key));});
+ app.post('/api/import',upload,(req,res)=>{try{if(typeof req.body.text!=='string')throw new Error('No readable PDF text.');const parsed=parseBill(req.body.text);if(!req.file||req.file.buffer.subarray(0,5).toString()!=='%PDF-')throw new Error('Choose a valid PDF.');const digest=createHash('sha256').update(req.file.buffer).digest('hex');const row=db.prepare("SELECT data FROM records WHERE kind='bill' AND (json_extract(data,'$.fileHash')=? OR (json_extract(data,'$.provider')=? AND json_extract(data,'$.start')=? AND json_extract(data,'$.end')=?))").get(digest,parsed.provider,parsed.start,parsed.end);if(row){let bill=JSON.parse(row.data);if(bill.file)return res.json({status:'duplicate',bill,message:'Already in your library.'});bill={...bill,file:putFile(req.file,parsed.filename),filename:parsed.filename,fileHash:digest,billDate:bill.billDate||parsed.billDate};save(bill);return res.json({status:'attached',bill,message:'PDF attached to existing bill.'});}const bill={...parsed,id:randomUUID(),kind:'bill',file:putFile(req.file,parsed.filename),fileHash:digest,source:'pdf-import',importedAt:new Date().toISOString()};save(bill);res.json({status:'imported',bill,message:'Imported automatically.'});}catch(e){res.status(422).json({error:e.message});}});
+ app.get('/api/health',(_req,res)=>res.json({ok:true}));app.use('/api',(_req,res)=>res.status(404).json({error:'Not found'}));app.use(express.static(path.join(root,'dist')));app.get('/',(_req,res)=>res.sendFile(path.join(root,'dist','index.html')));
+ app.use((err,req,res,next)=>res.status(err.code==='LIMIT_FILE_SIZE'?413:400).json({error:err.code==='LIMIT_FILE_SIZE'?'Choose a PDF under 15 MB.':'Request failed. Check the file or record and try again.'}));return {app,close:()=>db.close()};
+}
+if(process.argv[1]===fileURLToPath(import.meta.url)){const {app}=createApp(path.resolve(process.env.DATA_DIR||path.join(root,'data')));app.listen(Number(process.env.PORT||3000),process.env.HOST||'127.0.0.1',()=>console.log('Hearth ready at http://localhost:'+ (process.env.PORT||3000)));}
